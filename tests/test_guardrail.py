@@ -10,22 +10,34 @@ pytestmark = pytest.mark.anyio
 
 
 def simple_model(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
-    return ModelResponse(parts=[TextPart(content="ok")])
+    return ModelResponse(parts=[TextPart(content='ok')])
 
 
-async def test_guardrail_called():
+async def test_output_guardrail_called():
     triggered = asyncio.Event()
 
     async def gr(messages: list[ModelMessage], ctx: RunContext[None]) -> None:
         await asyncio.sleep(0)
         triggered.set()
 
-    agent = Agent(FunctionModel(simple_model), guardrails=[gr])
-    await agent.run("hi")
+    agent = Agent(FunctionModel(simple_model), output_guardrails=[gr])
+    await agent.run('hi')
     assert triggered.is_set()
 
 
-async def test_guardrail_blocks_until_complete():
+async def test_input_guardrail_called():
+    triggered = asyncio.Event()
+
+    async def gr(messages: list[ModelMessage], ctx: RunContext[None]) -> None:
+        await asyncio.sleep(0)
+        triggered.set()
+
+    agent = Agent(FunctionModel(simple_model), input_guardrails=[gr])
+    await agent.run('hi')
+    assert triggered.is_set()
+
+
+async def test_output_guardrail_blocks_until_complete():
     done = False
 
     async def gr(messages: list[ModelMessage], ctx: RunContext[None]) -> None:
@@ -33,7 +45,6 @@ async def test_guardrail_blocks_until_complete():
         await asyncio.sleep(0.05)
         done = True
 
-    agent = Agent(FunctionModel(simple_model), guardrails=[gr])
-    await agent.run("hi")
+    agent = Agent(FunctionModel(simple_model), output_guardrails=[gr])
+    await agent.run('hi')
     assert done
-

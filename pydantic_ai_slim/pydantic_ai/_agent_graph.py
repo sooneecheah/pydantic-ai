@@ -34,6 +34,8 @@ __all__ = (
     'build_run_context',
     'capture_run_messages',
     'HistoryProcessor',
+    'InputGuardrail',
+    'OutputGuardrail',
     'Guardrail',
 )
 
@@ -67,8 +69,13 @@ HistoryProcessor = Union[
 Can optionally accept a `RunContext` as a parameter.
 """
 
-Guardrail = Callable[[list[_messages.ModelMessage], RunContext[DepsT]], Awaitable[Any]]
+InputGuardrail = Callable[[list[_messages.ModelMessage], RunContext[DepsT]], Awaitable[Any]]
+"""A callback executed asynchronously when a user prompt is added."""
+
+OutputGuardrail = Callable[[list[_messages.ModelMessage], RunContext[DepsT]], Awaitable[Any]]
 """A callback executed asynchronously after each model response."""
+
+Guardrail = OutputGuardrail
 
 
 @dataclasses.dataclass
@@ -111,7 +118,8 @@ class GraphAgentDeps(Generic[DepsT, OutputDataT]):
     output_validators: list[_output.OutputValidator[DepsT, OutputDataT]]
 
     history_processors: Sequence[HistoryProcessor[DepsT]]
-    guardrails: Sequence[Guardrail[DepsT]]
+    input_guardrails: Sequence[InputGuardrail[DepsT]]
+    output_guardrails: Sequence[OutputGuardrail[DepsT]]
 
     function_tools: dict[str, Tool[DepsT]] = dataclasses.field(repr=False)
     mcp_servers: Sequence[MCPServer] = dataclasses.field(repr=False)
@@ -386,6 +394,11 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
     ) -> tuple[ModelSettings | None, models.ModelRequestParameters]:
         ctx.state.message_history.append(self.request)
 
+        run_ctx = build_run_context(ctx)
+        for guardrail in ctx.deps.input_guardrails:
+            task = asyncio.create_task(guardrail(ctx.state.message_history[:], run_ctx))
+            ctx.state.guardrail_tasks.append(task)
+
         # Check usage
         if ctx.deps.usage_limits:  # pragma: no branch
             ctx.deps.usage_limits.check_before_request(ctx.state.usage)
@@ -411,7 +424,7 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
         ctx.state.message_history.append(response)
 
         run_ctx = build_run_context(ctx)
-        for guardrail in ctx.deps.guardrails:
+        for guardrail in ctx.deps.output_guardrails:
             task = asyncio.create_task(guardrail(ctx.state.message_history[:], run_ctx))
             ctx.state.guardrail_tasks.append(task)
 
