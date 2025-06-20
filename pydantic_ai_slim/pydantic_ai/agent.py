@@ -1,5 +1,6 @@
 from __future__ import annotations as _annotations
 
+import asyncio
 import dataclasses
 import inspect
 import json
@@ -28,7 +29,7 @@ from . import (
     result,
     usage as _usage,
 )
-from ._agent_graph import HistoryProcessor
+from ._agent_graph import Guardrail, HistoryProcessor
 from .models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
 from .result import FinalResult, OutputDataT, StreamedRunResult
 from .settings import ModelSettings, merge_model_settings
@@ -75,6 +76,7 @@ __all__ = (
     'ModelRequestNode',
     'UserPromptNode',
     'InstrumentationSettings',
+    'Guardrail',
 )
 
 
@@ -181,6 +183,7 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
         end_strategy: EndStrategy = 'early',
         instrument: InstrumentationSettings | bool | None = None,
         history_processors: Sequence[HistoryProcessor[AgentDepsT]] | None = None,
+        guardrails: Sequence[Guardrail[AgentDepsT]] | None = None,
     ) -> None: ...
 
     @overload
@@ -211,6 +214,7 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
         end_strategy: EndStrategy = 'early',
         instrument: InstrumentationSettings | bool | None = None,
         history_processors: Sequence[HistoryProcessor[AgentDepsT]] | None = None,
+        guardrails: Sequence[Guardrail[AgentDepsT]] | None = None,
     ) -> None: ...
 
     def __init__(
@@ -236,6 +240,7 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
         end_strategy: EndStrategy = 'early',
         instrument: InstrumentationSettings | bool | None = None,
         history_processors: Sequence[HistoryProcessor[AgentDepsT]] | None = None,
+        guardrails: Sequence[Guardrail[AgentDepsT]] | None = None,
         **_deprecated_kwargs: Any,
     ):
         """Create an agent.
@@ -282,6 +287,9 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
             history_processors: Optional list of callables to process the message history before sending it to the model.
                 Each processor takes a list of messages and returns a modified list of messages.
                 Processors can be sync or async and are applied in sequence.
+            guardrails: Optional list of async callbacks that receive the message history and run context
+                after each model response. Guardrails are executed concurrently with agent execution,
+                and all tasks must finish before the run result is returned.
         """
         if model is None or defer_model_check:
             self.model = model
@@ -351,6 +359,7 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
         self._mcp_servers = mcp_servers
         self._prepare_tools = prepare_tools
         self.history_processors = history_processors or []
+        self.guardrails = guardrails or []
         for tool in tools:
             if isinstance(tool, Tool):
                 self._register_tool(tool)
@@ -647,6 +656,7 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
             usage=usage,
             retries=0,
             run_step=0,
+            guardrail_tasks=[],
         )
 
         # We consider it a user error if a user tries to restrict the result type while having an output validator that
@@ -699,6 +709,7 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
             output_schema=output_schema,
             output_validators=output_validators,
             history_processors=self.history_processors,
+            guardrails=self.guardrails,
             function_tools=run_function_tools,
             mcp_servers=self._mcp_servers,
             default_retries=self._default_retries,
@@ -725,6 +736,8 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
             ) as graph_run:
                 agent_run = AgentRun(graph_run)
                 yield agent_run
+                if graph_run.state.guardrail_tasks:
+                    await asyncio.gather(*graph_run.state.guardrail_tasks)
                 if (final_result := agent_run.result) is not None and run_span.is_recording():
                     run_span.set_attribute(
                         'final_result',
@@ -1309,6 +1322,32 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
 
     @deprecated('`result_validator` is deprecated, use `output_validator` instead.')
     def result_validator(self, func: Any, /) -> Any: ...
+
+    @overload
+    def guardrail(self, func: Guardrail[AgentDepsT], /) -> Guardrail[AgentDepsT]: ...
+
+    @overload
+    def guardrail(self, /) -> Callable[[Guardrail[AgentDepsT]], Guardrail[AgentDepsT]]: ...
+
+    def guardrail(
+        self,
+        func: Guardrail[AgentDepsT] | None = None,
+    ) -> Guardrail[AgentDepsT] | Callable[[Guardrail[AgentDepsT]], Guardrail[AgentDepsT]]:
+        """Decorator to register an asynchronous guardrail callback.
+
+        The callback receives the full message history and `RunContext` after each model response.
+        It runs concurrently with the agent execution and is awaited before returning the final result.
+        """
+        if func is None:
+
+            def decorator(func_: Guardrail[AgentDepsT]) -> Guardrail[AgentDepsT]:
+                self.guardrails.append(func_)
+                return func_
+
+            return decorator
+        else:
+            self.guardrails.append(func)
+            return func
 
     @overload
     def tool(self, func: ToolFuncContext[AgentDepsT, ToolParams], /) -> ToolFuncContext[AgentDepsT, ToolParams]: ...

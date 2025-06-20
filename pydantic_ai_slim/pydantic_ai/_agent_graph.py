@@ -34,6 +34,7 @@ __all__ = (
     'build_run_context',
     'capture_run_messages',
     'HistoryProcessor',
+    'Guardrail',
 )
 
 
@@ -66,6 +67,8 @@ HistoryProcessor = Union[
 Can optionally accept a `RunContext` as a parameter.
 """
 
+Guardrail = Callable[[list[_messages.ModelMessage], RunContext[DepsT]], Awaitable[Any]]
+
 
 @dataclasses.dataclass
 class GraphAgentState:
@@ -75,6 +78,7 @@ class GraphAgentState:
     usage: _usage.Usage
     retries: int
     run_step: int
+    guardrail_tasks: list[asyncio.Task[Any]] = dataclasses.field(default_factory=list, repr=False)
 
     def increment_retries(self, max_result_retries: int, error: Exception | None = None) -> None:
         self.retries += 1
@@ -106,6 +110,7 @@ class GraphAgentDeps(Generic[DepsT, OutputDataT]):
     output_validators: list[_output.OutputValidator[DepsT, OutputDataT]]
 
     history_processors: Sequence[HistoryProcessor[DepsT]]
+    guardrails: Sequence[Guardrail[DepsT]]
 
     function_tools: dict[str, Tool[DepsT]] = dataclasses.field(repr=False)
     mcp_servers: Sequence[MCPServer] = dataclasses.field(repr=False)
@@ -403,6 +408,13 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
 
         # Append the model response to state.message_history
         ctx.state.message_history.append(response)
+
+        # Trigger guardrail callbacks asynchronously
+        if ctx.deps.guardrails:
+            run_context = build_run_context(ctx)
+            for guardrail in ctx.deps.guardrails:
+                task = asyncio.create_task(guardrail(ctx.state.message_history, run_context))
+                ctx.state.guardrail_tasks.append(task)
 
         # Set the `_result` attribute since we can't use `return` in an async iterator
         self._result = CallToolsNode(response)

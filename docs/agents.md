@@ -524,6 +524,24 @@ except UnexpectedModelBehavior as e:
 
 1. This error is raised because the safety thresholds were exceeded.
 
+#### Guardrail callbacks
+
+You can register asynchronous callbacks that inspect the message history after each model response.
+Guardrails run concurrently with the agent and are awaited before the final result is returned.
+
+```python {title="guardrail.py"}
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ModelMessage
+
+agent = Agent('openai:gpt-4o')
+
+@agent.guardrail
+async def log_response(messages: list[ModelMessage], ctx: RunContext[None]) -> None:
+    print('Latest response:', messages[-1])
+
+result = agent.run_sync('Hello')
+```
+
 ## Runs vs. Conversations
 
 An agent **run** might represent an entire conversation — there's no limit to how many messages can be exchanged in a single run. However, a **conversation** might also be composed of multiple runs, especially if you need to maintain state between separate interactions or API calls.
