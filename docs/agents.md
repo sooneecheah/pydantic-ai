@@ -553,6 +553,35 @@ print(result2.output)
 
 _(This example is complete, it can be run "as is")_
 
+## Asynchronous guardrails
+
+Guardrails are async callbacks that run beside the agent and are awaited before
+the run completes. There are two kinds:
+
+* **Input guardrails** run whenever a user prompt is added to the message history.
+  By default they run in parallel with the next model request, but you can pass
+  ``is_blocking=True`` to force them to finish before the request is made.
+* **Output guardrails** run after each model response.
+
+Both receive the full message history and a [`RunContext`][pydantic_ai.tools.RunContext],
+allowing you to integrate custom validation or logging logic.
+
+```python {title="guardrails.py"}
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ModelMessage
+
+agent = Agent('openai:gpt-4o')
+
+@agent.input_guardrail(is_blocking=True)
+async def check_input(messages: list[ModelMessage], ctx: RunContext[None]) -> None:
+    if 'stop' in getattr(messages[-1], 'content', ''):
+        print('user asked to stop')
+
+@agent.output_guardrail
+async def log_output(messages: list[ModelMessage], ctx: RunContext[None]) -> None:
+    print('model responded with', messages[-1])
+```
+
 ## Type safe by design {#static-type-checking}
 
 PydanticAI is designed to work well with static type checkers, like mypy and pyright.
