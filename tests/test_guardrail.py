@@ -86,3 +86,45 @@ async def test_input_guardrail_runs_in_parallel_by_default():
     assert events[0] == 'gr_start'
     assert events[1] == 'model'
     assert events[-1] == 'gr_end'
+
+async def test_input_guardrail_decorator_registers():
+    triggered = asyncio.Event()
+    agent = Agent(FunctionModel(simple_model))
+
+    @agent.input_guardrail
+    async def deco(messages: list[ModelMessage], ctx: RunContext[None]) -> None:
+        triggered.set()
+
+    await agent.run('hi')
+    assert triggered.is_set()
+
+
+async def test_output_guardrail_decorator_registers():
+    triggered = asyncio.Event()
+    agent = Agent(FunctionModel(simple_model))
+
+    @agent.output_guardrail
+    async def deco(messages: list[ModelMessage], ctx: RunContext[None]) -> None:
+        triggered.set()
+
+    await agent.run('hi')
+    assert triggered.is_set()
+
+
+async def test_input_guardrail_decorator_blocking():
+    events: list[str] = []
+
+    def model(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:
+        events.append('model')
+        return ModelResponse(parts=[TextPart(content='ok')])
+
+    agent = Agent(FunctionModel(model))
+
+    @agent.input_guardrail(is_blocking=True)
+    async def deco(messages: list[ModelMessage], ctx: RunContext[None]) -> None:
+        events.append('gr_start')
+        await asyncio.sleep(0.05)
+        events.append('gr_end')
+
+    await agent.run('hi')
+    assert events == ['gr_start', 'gr_end', 'model']
