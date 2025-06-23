@@ -5,6 +5,7 @@ from .exceptions import (
     AgentRunError,
     FallbackExceptionGroup,
     ModelHTTPError,
+    InputGuardrailTriggered,
     ModelRetry,
     UnexpectedModelBehavior,
     UsageLimitExceeded,
@@ -27,6 +28,7 @@ __all__ = (
     # exceptions
     'AgentRunError',
     'ModelRetry',
+    'InputGuardrailTriggered',
     'ModelHTTPError',
     'FallbackExceptionGroup',
     'UnexpectedModelBehavior',

@@ -75,7 +75,11 @@ InputGuardrailFunc = Callable[[list[_messages.ModelMessage], RunContext[DepsT]],
 
 @dataclasses.dataclass(slots=True)
 class InputGuardrail(Generic[DepsT]):
-    """An optional blocking callback executed when a user prompt is added."""
+    """Callback executed when a user prompt is added.
+
+    If the callback raises :class:`~pydantic_ai.exceptions.InputGuardrailTriggered`,
+    the agent run will be aborted.
+    """
 
     func: InputGuardrailFunc[DepsT]
     is_blocking: bool = False
@@ -97,6 +101,9 @@ class GraphAgentState:
     retries: int
     run_step: int
     guardrail_tasks: list[asyncio.Task[Any]] = field(default_factory=list, repr=False)
+    terminate_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    """Event signaled when a guardrail triggers termination."""
+    termination_error: BaseException | None = field(default=None, repr=False)
 
     def increment_retries(self, max_result_retries: int, error: Exception | None = None) -> None:
         self.retries += 1
@@ -138,6 +145,17 @@ class GraphAgentDeps(Generic[DepsT, OutputDataT]):
     tracer: Tracer
 
     prepare_tools: ToolsPrepareFunc[DepsT] | None = None
+
+
+def _guardrail_task_done(state: GraphAgentState, task: asyncio.Task[Any]) -> None:
+    """Handle completion of an input guardrail task."""
+    if task.cancelled():
+        return
+    try:
+        task.result()
+    except exceptions.InputGuardrailTriggered as exc:  # pragma: no cover - tests set event
+        state.termination_error = exc
+        state.terminate_event.set()
 
 
 class AgentNode(BaseNode[GraphAgentState, GraphAgentDeps[DepsT, Any], result.FinalResult[NodeRunEndT]]):
@@ -363,6 +381,10 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
     ) -> AsyncIterator[models.StreamedResponse]:
         assert not self._did_stream, 'stream() should only be called once per node'
 
+        if ctx.state.terminate_event.is_set():
+            assert ctx.state.termination_error is not None
+            raise ctx.state.termination_error
+
         model_settings, model_request_parameters = await self._prepare_request(ctx)
         model_request_parameters = ctx.deps.model.customize_request_parameters(model_request_parameters)
         message_history = await _process_message_history(
@@ -389,6 +411,10 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
         if self._result is not None:
             return self._result  # pragma: no cover
 
+        if ctx.state.terminate_event.is_set():
+            assert ctx.state.termination_error is not None
+            raise ctx.state.termination_error
+
         model_settings, model_request_parameters = await self._prepare_request(ctx)
         model_request_parameters = ctx.deps.model.customize_request_parameters(model_request_parameters)
         message_history = await _process_message_history(
@@ -402,15 +428,29 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
     async def _prepare_request(
         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
     ) -> tuple[ModelSettings | None, models.ModelRequestParameters]:
+        if ctx.state.terminate_event.is_set():
+            assert ctx.state.termination_error is not None
+            raise ctx.state.termination_error
+
         ctx.state.message_history.append(self.request)
 
         run_ctx = build_run_context(ctx)
         for guardrail in ctx.deps.input_guardrails:
             if guardrail.is_blocking:
-                await guardrail(ctx.state.message_history[:], run_ctx)
+                try:
+                    await guardrail(ctx.state.message_history[:], run_ctx)
+                except exceptions.InputGuardrailTriggered as exc:
+                    ctx.state.termination_error = exc
+                    ctx.state.terminate_event.set()
+                    raise
             else:
                 task = asyncio.create_task(guardrail(ctx.state.message_history[:], run_ctx))
+                task.add_done_callback(lambda t, s=ctx.state: _guardrail_task_done(s, t))
                 ctx.state.guardrail_tasks.append(task)
+
+        if ctx.state.terminate_event.is_set():
+            assert ctx.state.termination_error is not None
+            raise ctx.state.termination_error
 
         # Check usage
         if ctx.deps.usage_limits:  # pragma: no branch

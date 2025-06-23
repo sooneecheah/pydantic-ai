@@ -15,6 +15,7 @@ __all__ = (
     'UnexpectedModelBehavior',
     'UsageLimitExceeded',
     'ModelHTTPError',
+    'InputGuardrailTriggered',
     'FallbackExceptionGroup',
 )
 
@@ -109,6 +110,10 @@ class ModelHTTPError(AgentRunError):
         self.body = body
         message = f'status_code: {status_code}, model_name: {model_name}, body: {body}'
         super().__init__(message)
+
+
+class InputGuardrailTriggered(AgentRunError):
+    """Raised when an input guardrail terminates the run."""
 
 
 class FallbackExceptionGroup(ExceptionGroup):
