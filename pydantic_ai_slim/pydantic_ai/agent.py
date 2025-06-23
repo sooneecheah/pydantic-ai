@@ -744,6 +744,9 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
             system_prompt_dynamic_functions=self._system_prompt_dynamic_functions,
         )
 
+        graph_run: (
+            GraphRun[_agent_graph.GraphAgentState, _agent_graph.GraphAgentDeps[AgentDepsT, RunOutputDataT]] | None
+        ) = None
         try:
             async with graph.iter(
                 start_node,
@@ -751,8 +754,9 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
                 deps=graph_deps,
                 span=use_span(run_span) if run_span.is_recording() else None,
                 infer_name=False,
-            ) as graph_run:
-                agent_run = AgentRun(graph_run)
+            ) as graph_run_cm:
+                graph_run = graph_run_cm
+                agent_run = AgentRun(graph_run_cm)
                 yield agent_run
                 if (final_result := agent_run.result) is not None and run_span.is_recording():
                     run_span.set_attribute(
@@ -766,7 +770,11 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
         finally:
             try:
                 if state.guardrail_tasks:
-                    await asyncio.gather(*state.guardrail_tasks)
+                    try:
+                        await asyncio.gather(*state.guardrail_tasks)
+                    except _agent_graph.GuardrailTermination as e:
+                        if graph_run is not None:
+                            graph_run._next_node = End(e.final_result)
                 if instrumentation_settings and run_span.is_recording():
                     run_span.set_attributes(self._run_span_end_attributes(state, usage, instrumentation_settings))
             finally:

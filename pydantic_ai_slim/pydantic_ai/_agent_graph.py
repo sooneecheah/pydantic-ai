@@ -111,7 +111,7 @@ class GraphAgentState:
     usage: _usage.Usage
     retries: int
     run_step: int
-    guardrail_tasks: list[asyncio.Task[Any]] = field(default_factory=list, repr=False)
+    guardrail_tasks: list[Any] = field(default_factory=list, repr=False)
 
     def increment_retries(self, max_result_retries: int, error: Exception | None = None) -> None:
         self.retries += 1
@@ -407,7 +407,7 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
         try:
             model_settings, model_request_parameters = await self._prepare_request(ctx)
         except GuardrailTermination as e:
-            return self._handle_final_result(ctx, e.final_result, [])
+            return End(e.final_result)
         model_request_parameters = ctx.deps.model.customize_request_parameters(model_request_parameters)
         message_history = await _process_message_history(
             ctx.state.message_history, ctx.deps.history_processors, build_run_context(ctx)
@@ -435,6 +435,9 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
             else:
                 task = asyncio.create_task(_run_guardrail(guardrail))
                 ctx.state.guardrail_tasks.append(task)
+                await asyncio.sleep(0)
+                if task.done():
+                    await task
 
         # Check usage
         if ctx.deps.usage_limits:  # pragma: no branch
