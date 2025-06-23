@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, FinalResult
 from pydantic_ai._agent_graph import InputGuardrail
 from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart
 from pydantic_ai.models.function import AgentInfo, FunctionModel
@@ -87,6 +87,7 @@ async def test_input_guardrail_runs_in_parallel_by_default():
     assert events[1] == 'model'
     assert events[-1] == 'gr_end'
 
+
 async def test_input_guardrail_decorator_registers():
     triggered = asyncio.Event()
     agent = Agent(FunctionModel(simple_model))
@@ -128,3 +129,20 @@ async def test_input_guardrail_decorator_blocking():
 
     await agent.run('hi')
     assert events == ['gr_start', 'gr_end', 'model']
+
+
+async def test_input_guardrail_can_end_run():
+    called = False
+
+    def model(messages: list[ModelMessage], _: AgentInfo) -> ModelResponse:  # pragma: no cover
+        nonlocal called
+        called = True
+        return ModelResponse(parts=[TextPart(content='should not run')])
+
+    async def gr(messages: list[ModelMessage], ctx: RunContext[None]) -> FinalResult[str]:
+        return FinalResult('blocked', None, None)
+
+    agent = Agent(FunctionModel(model), input_guardrails=[gr])
+    result = await agent.run('hi')
+    assert result.output == 'blocked'
+    assert not called
