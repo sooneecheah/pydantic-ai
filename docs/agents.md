@@ -21,7 +21,7 @@ In typing terms, agents are generic in their dependency and output types, e.g., 
 Here's a toy example of an agent that simulates a roulette wheel:
 
 ```python {title="roulette_wheel.py"}
-from pydantic_ai import Agent, RunContext
+from pydantic_ai import Agent, RunContext, FinalResult
 
 roulette_agent = Agent(  # (1)!
     'openai:gpt-4o',
@@ -552,6 +552,37 @@ print(result2.output)
 1. Continue the conversation; without `message_history` the model would not know who "his" was referring to.
 
 _(This example is complete, it can be run "as is")_
+
+## Asynchronous guardrails
+
+Guardrails are async callbacks that run beside the agent and are awaited before
+the run completes. There are two kinds:
+
+* **Input guardrails** run whenever a user prompt is added to the message history.
+  By default they run in parallel with the next model request, but you can pass
+  ``is_blocking=True`` to force them to finish before the request is made.
+* **Output guardrails** run after each model response.
+
+Both receive the full message history and a [`RunContext`][pydantic_ai.tools.RunContext],
+allowing you to integrate custom validation or logging logic. If an input guardrail
+returns a [`FinalResult`][pydantic_ai.result.FinalResult], the agent run will stop immediately
+and that result will be returned.
+
+```python {title="guardrails.py"}
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import ModelMessage
+
+agent = Agent('openai:gpt-4o')
+
+@agent.input_guardrail(is_blocking=True)
+async def check_input(messages: list[ModelMessage], ctx: RunContext[None]) -> FinalResult[str] | None:
+    if 'stop' in getattr(messages[-1], 'content', ''):
+        return FinalResult('Stopped by guardrail', None, None)
+
+@agent.output_guardrail
+async def log_output(messages: list[ModelMessage], ctx: RunContext[None]) -> None:
+    print('model responded with', messages[-1])
+```
 
 ## Type safe by design {#static-type-checking}
 

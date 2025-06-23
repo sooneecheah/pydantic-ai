@@ -1,5 +1,6 @@
 from __future__ import annotations as _annotations
 
+import asyncio
 import dataclasses
 import inspect
 import json
@@ -28,7 +29,12 @@ from . import (
     result,
     usage as _usage,
 )
-from ._agent_graph import HistoryProcessor
+from ._agent_graph import (
+    HistoryProcessor,
+    InputGuardrail,
+    InputGuardrailFunc,
+    OutputGuardrail,
+)
 from .models.instrumented import InstrumentationSettings, InstrumentedModel, instrument_model
 from .result import FinalResult, OutputDataT, StreamedRunResult
 from .settings import ModelSettings, merge_model_settings
@@ -181,6 +187,8 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
         end_strategy: EndStrategy = 'early',
         instrument: InstrumentationSettings | bool | None = None,
         history_processors: Sequence[HistoryProcessor[AgentDepsT]] | None = None,
+        input_guardrails: Sequence[InputGuardrail[AgentDepsT] | InputGuardrailFunc[AgentDepsT]] | None = None,
+        output_guardrails: Sequence[OutputGuardrail[AgentDepsT]] | None = None,
     ) -> None: ...
 
     @overload
@@ -211,6 +219,8 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
         end_strategy: EndStrategy = 'early',
         instrument: InstrumentationSettings | bool | None = None,
         history_processors: Sequence[HistoryProcessor[AgentDepsT]] | None = None,
+        input_guardrails: Sequence[InputGuardrail[AgentDepsT] | InputGuardrailFunc[AgentDepsT]] | None = None,
+        output_guardrails: Sequence[OutputGuardrail[AgentDepsT]] | None = None,
     ) -> None: ...
 
     def __init__(
@@ -236,6 +246,8 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
         end_strategy: EndStrategy = 'early',
         instrument: InstrumentationSettings | bool | None = None,
         history_processors: Sequence[HistoryProcessor[AgentDepsT]] | None = None,
+        input_guardrails: Sequence[InputGuardrail[AgentDepsT] | InputGuardrailFunc[AgentDepsT]] | None = None,
+        output_guardrails: Sequence[OutputGuardrail[AgentDepsT]] | None = None,
         **_deprecated_kwargs: Any,
     ):
         """Create an agent.
@@ -282,6 +294,14 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
             history_processors: Optional list of callables to process the message history before sending it to the model.
                 Each processor takes a list of messages and returns a modified list of messages.
                 Processors can be sync or async and are applied in sequence.
+            input_guardrails: Optional list of callbacks executed whenever a user prompt is added.
+                Each callback may be provided as a callable or an
+                [`InputGuardrail`][pydantic_ai._agent_graph.InputGuardrail] instance.
+                Guardrails run concurrently with the agent and are awaited before
+                the run completes. Set ``is_blocking=True`` on a guardrail to block
+                the next model request until it finishes.
+            output_guardrails: Optional list of async callables executed after each model response.
+                These run concurrently with the agent and are awaited before the run completes.
         """
         if model is None or defer_model_check:
             self.model = model
@@ -351,6 +371,13 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
         self._mcp_servers = mcp_servers
         self._prepare_tools = prepare_tools
         self.history_processors = history_processors or []
+        if input_guardrails:
+            self.input_guardrails = [
+                g if isinstance(g, InputGuardrail) else InputGuardrail(g) for g in input_guardrails
+            ]
+        else:
+            self.input_guardrails = []
+        self.output_guardrails = list(output_guardrails) if output_guardrails else []
         for tool in tools:
             if isinstance(tool, Tool):
                 self._register_tool(tool)
@@ -699,6 +726,8 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
             output_schema=output_schema,
             output_validators=output_validators,
             history_processors=self.history_processors,
+            input_guardrails=self.input_guardrails,
+            output_guardrails=self.output_guardrails,
             function_tools=run_function_tools,
             mcp_servers=self._mcp_servers,
             default_retries=self._default_retries,
@@ -715,6 +744,9 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
             system_prompt_dynamic_functions=self._system_prompt_dynamic_functions,
         )
 
+        graph_run: (
+            GraphRun[_agent_graph.GraphAgentState, _agent_graph.GraphAgentDeps[AgentDepsT, RunOutputDataT]] | None
+        ) = None
         try:
             async with graph.iter(
                 start_node,
@@ -722,8 +754,9 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
                 deps=graph_deps,
                 span=use_span(run_span) if run_span.is_recording() else None,
                 infer_name=False,
-            ) as graph_run:
-                agent_run = AgentRun(graph_run)
+            ) as graph_run_cm:
+                graph_run = graph_run_cm
+                agent_run = AgentRun(graph_run_cm)
                 yield agent_run
                 if (final_result := agent_run.result) is not None and run_span.is_recording():
                     run_span.set_attribute(
@@ -736,6 +769,12 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
                     )
         finally:
             try:
+                if state.guardrail_tasks:
+                    try:
+                        await asyncio.gather(*state.guardrail_tasks)
+                    except _agent_graph.GuardrailTermination as e:
+                        if graph_run is not None:
+                            graph_run._next_node = End(e.final_result)
                 if instrumentation_settings and run_span.is_recording():
                     run_span.set_attributes(self._run_span_end_attributes(state, usage, instrumentation_settings))
             finally:
@@ -1309,6 +1348,50 @@ class Agent(Generic[AgentDepsT, OutputDataT]):
 
     @deprecated('`result_validator` is deprecated, use `output_validator` instead.')
     def result_validator(self, func: Any, /) -> Any: ...
+
+    @overload
+    def input_guardrail(
+        self, func: InputGuardrailFunc[AgentDepsT], /, *, is_blocking: bool = False
+    ) -> InputGuardrail[AgentDepsT]: ...
+
+    def input_guardrail(
+        self,
+        func: InputGuardrailFunc[AgentDepsT] | None = None,
+        /,
+        *,
+        is_blocking: bool = False,
+    ) -> InputGuardrail[AgentDepsT] | Callable[[InputGuardrailFunc[AgentDepsT]], InputGuardrail[AgentDepsT]]:
+        """Decorator to register an asynchronous input guardrail callback."""
+        if func is None:
+
+            def decorator(func_: InputGuardrailFunc[AgentDepsT]) -> InputGuardrail[AgentDepsT]:
+                g = InputGuardrail(func_, is_blocking=is_blocking)
+                self.input_guardrails.append(g)
+                return func_
+
+            return decorator
+        else:
+            g = InputGuardrail(func, is_blocking=is_blocking)
+            self.input_guardrails.append(g)
+            return func
+
+    @overload
+    def output_guardrail(self, func: OutputGuardrail[AgentDepsT], /) -> OutputGuardrail[AgentDepsT]: ...
+
+    def output_guardrail(
+        self, func: OutputGuardrail[AgentDepsT] | None = None, /
+    ) -> OutputGuardrail[AgentDepsT] | Callable[[OutputGuardrail[AgentDepsT]], OutputGuardrail[AgentDepsT]]:
+        """Decorator to register an asynchronous output guardrail callback."""
+        if func is None:
+
+            def decorator(func_: OutputGuardrail[AgentDepsT]) -> OutputGuardrail[AgentDepsT]:
+                self.output_guardrails.append(func_)
+                return func_
+
+            return decorator
+        else:
+            self.output_guardrails.append(func)
+            return func
 
     @overload
     def tool(self, func: ToolFuncContext[AgentDepsT, ToolParams], /) -> ToolFuncContext[AgentDepsT, ToolParams]: ...

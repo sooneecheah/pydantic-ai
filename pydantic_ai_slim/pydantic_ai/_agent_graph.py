@@ -34,6 +34,9 @@ __all__ = (
     'build_run_context',
     'capture_run_messages',
     'HistoryProcessor',
+    'InputGuardrailFunc',
+    'InputGuardrail',
+    'OutputGuardrail',
 )
 
 
@@ -66,6 +69,39 @@ HistoryProcessor = Union[
 Can optionally accept a `RunContext` as a parameter.
 """
 
+InputGuardrailFunc = Callable[
+    [list[_messages.ModelMessage], RunContext[DepsT]], Awaitable[result.FinalResult[Any] | None]
+]
+"""The callable invoked for an input guardrail.
+
+Returning a [`FinalResult`][pydantic_ai.result.FinalResult] will terminate the agent run.
+"""
+
+
+@dataclasses.dataclass(slots=True)
+class InputGuardrail(Generic[DepsT]):
+    """An optional blocking callback executed when a user prompt is added."""
+
+    func: InputGuardrailFunc[DepsT]
+    is_blocking: bool = False
+
+    async def __call__(
+        self, messages: list[_messages.ModelMessage], ctx: RunContext[DepsT]
+    ) -> result.FinalResult[Any] | None:
+        return await self.func(messages, ctx)
+
+
+class GuardrailTermination(Exception):
+    """Internal exception used to stop the agent when an input guardrail returns a final result."""
+
+    def __init__(self, final_result: result.FinalResult[Any]):
+        self.final_result = final_result
+        super().__init__()
+
+
+OutputGuardrail = Callable[[list[_messages.ModelMessage], RunContext[DepsT]], Awaitable[Any]]
+"""A callback executed asynchronously after each model response."""
+
 
 @dataclasses.dataclass
 class GraphAgentState:
@@ -75,6 +111,7 @@ class GraphAgentState:
     usage: _usage.Usage
     retries: int
     run_step: int
+    guardrail_tasks: list[Any] = field(default_factory=list, repr=False)
 
     def increment_retries(self, max_result_retries: int, error: Exception | None = None) -> None:
         self.retries += 1
@@ -106,6 +143,8 @@ class GraphAgentDeps(Generic[DepsT, OutputDataT]):
     output_validators: list[_output.OutputValidator[DepsT, OutputDataT]]
 
     history_processors: Sequence[HistoryProcessor[DepsT]]
+    input_guardrails: Sequence[InputGuardrail[DepsT]]
+    output_guardrails: Sequence[OutputGuardrail[DepsT]]
 
     function_tools: dict[str, Tool[DepsT]] = dataclasses.field(repr=False)
     mcp_servers: Sequence[MCPServer] = dataclasses.field(repr=False)
@@ -302,7 +341,7 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
 
     async def run(
         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
-    ) -> CallToolsNode[DepsT, NodeRunEndT]:
+    ) -> CallToolsNode[DepsT, NodeRunEndT] | End[result.FinalResult[NodeRunEndT]]:
         if self._result is not None:
             return self._result
 
@@ -361,11 +400,14 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
 
     async def _make_request(
         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
-    ) -> CallToolsNode[DepsT, NodeRunEndT]:
+    ) -> CallToolsNode[DepsT, NodeRunEndT] | End[result.FinalResult[NodeRunEndT]]:
         if self._result is not None:
             return self._result  # pragma: no cover
 
-        model_settings, model_request_parameters = await self._prepare_request(ctx)
+        try:
+            model_settings, model_request_parameters = await self._prepare_request(ctx)
+        except GuardrailTermination as e:
+            return End(e.final_result)
         model_request_parameters = ctx.deps.model.customize_request_parameters(model_request_parameters)
         message_history = await _process_message_history(
             ctx.state.message_history, ctx.deps.history_processors, build_run_context(ctx)
@@ -379,6 +421,23 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
         self, ctx: GraphRunContext[GraphAgentState, GraphAgentDeps[DepsT, NodeRunEndT]]
     ) -> tuple[ModelSettings | None, models.ModelRequestParameters]:
         ctx.state.message_history.append(self.request)
+
+        run_ctx = build_run_context(ctx)
+
+        async def _run_guardrail(g: InputGuardrail[DepsT]) -> None:
+            res = await g(ctx.state.message_history[:], run_ctx)
+            if isinstance(res, result.FinalResult):
+                raise GuardrailTermination(res)
+
+        for guardrail in ctx.deps.input_guardrails:
+            if guardrail.is_blocking:
+                await _run_guardrail(guardrail)
+            else:
+                task = asyncio.create_task(_run_guardrail(guardrail))
+                ctx.state.guardrail_tasks.append(task)
+                await asyncio.sleep(0)
+                if task.done():
+                    await task
 
         # Check usage
         if ctx.deps.usage_limits:  # pragma: no branch
@@ -403,6 +462,11 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
 
         # Append the model response to state.message_history
         ctx.state.message_history.append(response)
+
+        run_ctx = build_run_context(ctx)
+        for guardrail in ctx.deps.output_guardrails:
+            task = asyncio.create_task(guardrail(ctx.state.message_history[:], run_ctx))
+            ctx.state.guardrail_tasks.append(task)
 
         # Set the `_result` attribute since we can't use `return` in an async iterator
         self._result = CallToolsNode(response)
