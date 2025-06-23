@@ -386,6 +386,11 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
             raise ctx.state.termination_error
 
         model_settings, model_request_parameters = await self._prepare_request(ctx)
+
+        if ctx.state.terminate_event.is_set():
+            assert ctx.state.termination_error is not None
+            raise ctx.state.termination_error
+
         model_request_parameters = ctx.deps.model.customize_request_parameters(model_request_parameters)
         message_history = await _process_message_history(
             ctx.state.message_history, ctx.deps.history_processors, build_run_context(ctx)
@@ -416,10 +421,20 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
             raise ctx.state.termination_error
 
         model_settings, model_request_parameters = await self._prepare_request(ctx)
+
+        if ctx.state.terminate_event.is_set():
+            assert ctx.state.termination_error is not None
+            raise ctx.state.termination_error
+
         model_request_parameters = ctx.deps.model.customize_request_parameters(model_request_parameters)
         message_history = await _process_message_history(
             ctx.state.message_history, ctx.deps.history_processors, build_run_context(ctx)
         )
+
+        if ctx.state.terminate_event.is_set():
+            assert ctx.state.termination_error is not None
+            raise ctx.state.termination_error
+
         model_response = await ctx.deps.model.request(message_history, model_settings, model_request_parameters)
         ctx.state.usage.incr(_usage.Usage())
 
@@ -461,6 +476,11 @@ class ModelRequestNode(AgentNode[DepsT, NodeRunEndT]):
 
         model_settings = merge_model_settings(ctx.deps.model_settings, None)
         model_request_parameters = await _prepare_request_parameters(ctx)
+
+        if ctx.state.terminate_event.is_set():
+            assert ctx.state.termination_error is not None
+            raise ctx.state.termination_error
+
         return model_settings, model_request_parameters
 
     def _finish_handling(
